@@ -20,6 +20,14 @@ from Practice4.historical_figures import (
     HistoricalFigure,
     get_figure,
 )
+from Practice5.image_search_models import DEFAULT_INDEX_PATH, ImageSearchIndex, SearchResult
+from Practice5.image_search_service import (
+    DEFAULT_CAPTION_MODEL,
+    DEFAULT_EMBEDDING_MODEL,
+    SemanticImageSearchService,
+)
+from Practice6.paper_cluster_models import DEFAULT_CLUSTER_PLOT_PATH, PaperClusteringResult
+from Practice6.paper_cluster_service import DEFAULT_PAPER_EMBEDDING_MODEL, PaperClusteringService
 from openai_client import create_openai_client
 
 
@@ -1110,11 +1118,1149 @@ class HistoricalChatTab(tk.Frame):
         return "break"
 
 
+class ImageSearchTab(tk.Frame):
+    def __init__(self, master: tk.Misc, search_service: SemanticImageSearchService) -> None:
+        super().__init__(master, bg=APP_BG)
+        self.search_service = search_service
+
+        self.selected_paths: list[Path] = []
+        self.index: Optional[ImageSearchIndex] = None
+        self.result_photo: Optional[ImageTk.PhotoImage] = None
+        self.is_indexing = False
+        self.is_searching = False
+
+        self.query_var = tk.StringVar()
+        self.selection_summary_var = tk.StringVar(
+            value=(
+                "아직 인덱싱할 이미지가 선택되지 않았습니다. "
+                f"새 인덱스를 생성하면 {DEFAULT_INDEX_PATH.name} 파일로 저장됩니다."
+            )
+        )
+        self.index_meta_var = tk.StringVar(value="저장된 인덱스를 확인하는 중입니다.")
+        self.status_var = tk.StringVar(value="이미지를 선택해 인덱스를 생성한 뒤 검색하세요.")
+        self.result_title_var = tk.StringVar(value="검색 결과 미리보기")
+        self.result_meta_var = tk.StringVar(value="텍스트 쿼리를 입력하면 가장 유사한 이미지를 이곳에 표시합니다.")
+        self.result_caption_var = tk.StringVar(
+            value="이미지 캡션과 유사도 점수가 여기에 표시됩니다."
+        )
+
+        self._build_ui()
+        self._set_index_overview(
+            "인덱싱된 이미지 목록이 여기에 표시됩니다.\n\n"
+            "먼저 이미지를 선택하고 '인덱스 생성'을 실행하세요."
+        )
+        self._set_ranking_text(
+            "검색 결과 순위가 여기에 표시됩니다.\n\n"
+            "인덱스를 만든 뒤 텍스트 쿼리를 입력해 검색을 실행하세요."
+        )
+        self._clear_result_preview()
+        self._load_saved_index_if_exists()
+        self._update_action_states()
+
+    def _build_ui(self) -> None:
+        main_frame = tk.Frame(self, bg=APP_BG, padx=8, pady=14)
+        main_frame.pack(fill="both", expand=True)
+
+        header_frame = tk.Frame(main_frame, bg=APP_BG)
+        header_frame.pack(fill="x", pady=(0, 16))
+
+        tk.Label(
+            header_frame,
+            text="텍스트-이미지 유사도 검색",
+            bg=APP_BG,
+            fg=TEXT_COLOR,
+            font=("Helvetica", 21, "bold"),
+        ).pack(anchor="w")
+
+        tk.Label(
+            header_frame,
+            text="Vision API로 이미지 설명을 만들고 임베딩을 저장한 뒤, 텍스트 쿼리와 가장 가까운 이미지를 찾아 반환합니다.",
+            bg=APP_BG,
+            fg=MUTED_TEXT,
+            font=("Helvetica", 11),
+        ).pack(anchor="w", pady=(6, 0))
+
+        controls_card = tk.Frame(
+            main_frame,
+            bg=SURFACE_BG,
+            padx=18,
+            pady=16,
+            highlightbackground=BORDER_COLOR,
+            highlightthickness=1,
+        )
+        controls_card.pack(fill="x", pady=(0, 18))
+
+        self.select_images_button = ttk.Button(
+            controls_card,
+            text="이미지 선택",
+            style="Secondary.TButton",
+            command=self.select_images,
+        )
+        self.select_images_button.grid(row=0, column=0, padx=(0, 8), pady=4, sticky="w")
+
+        self.select_folder_button = ttk.Button(
+            controls_card,
+            text="폴더 불러오기",
+            style="Secondary.TButton",
+            command=self.select_folder,
+        )
+        self.select_folder_button.grid(row=0, column=1, padx=(0, 8), pady=4, sticky="w")
+
+        self.clear_selection_button = ttk.Button(
+            controls_card,
+            text="선택 초기화",
+            style="Secondary.TButton",
+            command=self.clear_selection,
+        )
+        self.clear_selection_button.grid(row=0, column=2, padx=(0, 18), pady=4, sticky="w")
+
+        self.build_index_button = ttk.Button(
+            controls_card,
+            text="인덱스 생성",
+            style="Primary.TButton",
+            command=self.build_index,
+        )
+        self.build_index_button.grid(row=0, column=3, padx=(0, 0), pady=4, sticky="w")
+
+        tk.Label(
+            controls_card,
+            textvariable=self.selection_summary_var,
+            bg=SURFACE_BG,
+            fg=MUTED_TEXT,
+            font=("Helvetica", 10),
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(12, 0))
+
+        search_card = tk.Frame(
+            main_frame,
+            bg=SURFACE_BG,
+            padx=18,
+            pady=16,
+            highlightbackground=BORDER_COLOR,
+            highlightthickness=1,
+        )
+        search_card.pack(fill="x", pady=(0, 18))
+        search_card.grid_columnconfigure(1, weight=1)
+
+        tk.Label(
+            search_card,
+            text="텍스트 쿼리",
+            bg=SURFACE_BG,
+            fg=TEXT_COLOR,
+            font=("Helvetica", 10, "bold"),
+        ).grid(row=0, column=0, padx=(0, 10), pady=4, sticky="w")
+
+        self.query_entry = ttk.Entry(search_card, textvariable=self.query_var)
+        self.query_entry.grid(row=0, column=1, sticky="ew", pady=4)
+        self.query_entry.bind("<Return>", self.on_query_return)
+
+        self.search_button = ttk.Button(
+            search_card,
+            text="유사 이미지 검색",
+            style="Primary.TButton",
+            command=self.search_images,
+        )
+        self.search_button.grid(row=0, column=2, padx=(12, 0), pady=4, sticky="e")
+
+        tk.Label(
+            search_card,
+            text=f"인덱스는 {DEFAULT_INDEX_PATH} 경로에 JSON으로 저장됩니다.",
+            bg=SURFACE_BG,
+            fg=MUTED_TEXT,
+            font=("Helvetica", 10),
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
+        content_frame = tk.Frame(main_frame, bg=APP_BG)
+        content_frame.pack(fill="both", expand=True)
+        content_frame.grid_columnconfigure(0, weight=5)
+        content_frame.grid_columnconfigure(1, weight=7)
+        content_frame.grid_rowconfigure(0, weight=1)
+
+        left_panel = tk.Frame(content_frame, bg=APP_BG)
+        left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+
+        right_panel = tk.Frame(content_frame, bg=APP_BG)
+        right_panel.grid(row=0, column=1, sticky="nsew")
+
+        self._build_index_panel(left_panel)
+        self._build_result_panel(right_panel)
+
+        tk.Label(
+            main_frame,
+            textvariable=self.status_var,
+            bg=STATUS_BG,
+            fg=TEXT_COLOR,
+            font=("Helvetica", 10),
+            anchor="w",
+            padx=12,
+            pady=10,
+            highlightbackground=BORDER_COLOR,
+            highlightthickness=1,
+        ).pack(fill="x", pady=(16, 0))
+
+    def _build_index_panel(self, parent: tk.Frame) -> None:
+        index_card = tk.Frame(
+            parent,
+            bg=SURFACE_BG,
+            padx=16,
+            pady=16,
+            highlightbackground=BORDER_COLOR,
+            highlightthickness=1,
+        )
+        index_card.pack(fill="both", expand=True)
+
+        tk.Label(
+            index_card,
+            text="인덱스된 이미지",
+            bg=SURFACE_BG,
+            fg=TEXT_COLOR,
+            font=("Helvetica", 15, "bold"),
+        ).pack(anchor="w")
+
+        tk.Label(
+            index_card,
+            textvariable=self.index_meta_var,
+            bg=SURFACE_BG,
+            fg=MUTED_TEXT,
+            font=("Helvetica", 10),
+            justify="left",
+            wraplength=360,
+        ).pack(anchor="w", pady=(4, 12))
+
+        self.index_overview = scrolledtext.ScrolledText(
+            index_card,
+            wrap=tk.WORD,
+            font=("Helvetica", 10),
+            bg="#fffdfa",
+            fg=TEXT_COLOR,
+            relief="flat",
+            highlightthickness=0,
+            padx=12,
+            pady=12,
+            spacing1=2,
+            spacing3=6,
+        )
+        self.index_overview.pack(fill="both", expand=True)
+
+    def _build_result_panel(self, parent: tk.Frame) -> None:
+        preview_card = tk.Frame(
+            parent,
+            bg=SURFACE_BG,
+            padx=16,
+            pady=16,
+            highlightbackground=BORDER_COLOR,
+            highlightthickness=1,
+        )
+        preview_card.pack(fill="both", expand=False)
+
+        tk.Label(
+            preview_card,
+            textvariable=self.result_title_var,
+            bg=SURFACE_BG,
+            fg=TEXT_COLOR,
+            font=("Helvetica", 15, "bold"),
+        ).pack(anchor="w")
+
+        tk.Label(
+            preview_card,
+            textvariable=self.result_meta_var,
+            bg=SURFACE_BG,
+            fg=MUTED_TEXT,
+            font=("Helvetica", 10),
+            justify="left",
+            wraplength=520,
+        ).pack(anchor="w", pady=(4, 12))
+
+        self.result_image_holder = tk.Frame(preview_card, bg=PANEL_BG, height=320)
+        self.result_image_holder.pack(fill="both", expand=False)
+        self.result_image_holder.pack_propagate(False)
+
+        self.result_image_label = tk.Label(
+            self.result_image_holder,
+            bg=PANEL_BG,
+            fg=MUTED_TEXT,
+            text="검색 결과 이미지가 여기에 표시됩니다.",
+            font=("Helvetica", 12),
+            justify="center",
+            wraplength=480,
+        )
+        self.result_image_label.pack(fill="both", expand=True, padx=18, pady=18)
+
+        tk.Label(
+            preview_card,
+            textvariable=self.result_caption_var,
+            bg=SURFACE_BG,
+            fg=TEXT_COLOR,
+            font=("Helvetica", 10),
+            justify="left",
+            wraplength=520,
+        ).pack(anchor="w", pady=(14, 0))
+
+        ranking_card = tk.Frame(
+            parent,
+            bg=SURFACE_BG,
+            padx=16,
+            pady=16,
+            highlightbackground=BORDER_COLOR,
+            highlightthickness=1,
+        )
+        ranking_card.pack(fill="both", expand=True, pady=(12, 0))
+
+        tk.Label(
+            ranking_card,
+            text="검색 결과 순위",
+            bg=SURFACE_BG,
+            fg=TEXT_COLOR,
+            font=("Helvetica", 15, "bold"),
+        ).pack(anchor="w")
+
+        tk.Label(
+            ranking_card,
+            text="상위 매칭 이미지들의 점수와 캡션 요약을 확인할 수 있습니다.",
+            bg=SURFACE_BG,
+            fg=MUTED_TEXT,
+            font=("Helvetica", 10),
+        ).pack(anchor="w", pady=(4, 12))
+
+        self.ranking_text = scrolledtext.ScrolledText(
+            ranking_card,
+            wrap=tk.WORD,
+            font=("Helvetica", 10),
+            bg="#fffdfa",
+            fg=TEXT_COLOR,
+            relief="flat",
+            highlightthickness=0,
+            padx=12,
+            pady=12,
+            spacing1=2,
+            spacing3=6,
+        )
+        self.ranking_text.pack(fill="both", expand=True)
+
+    def select_images(self) -> None:
+        file_paths = filedialog.askopenfilenames(
+            title="검색 인덱스를 만들 이미지 선택",
+            filetypes=[
+                ("Image files", "*.png *.jpg *.jpeg *.webp *.gif"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not file_paths:
+            return
+
+        self.selected_paths = [Path(path) for path in file_paths]
+        self._update_selection_summary()
+        self.status_var.set(f"인덱싱할 이미지 {len(self.selected_paths)}장을 선택했습니다.")
+        self._update_action_states()
+
+    def select_folder(self) -> None:
+        directory = filedialog.askdirectory(title="검색 인덱스를 만들 이미지 폴더 선택")
+        if not directory:
+            return
+
+        try:
+            paths = self.search_service.discover_images_in_directory(Path(directory))
+            if not paths:
+                raise ValueError("선택한 폴더 안에 지원되는 이미지가 없습니다.")
+        except Exception as exc:
+            self.status_var.set("폴더 선택 중 오류가 발생했습니다.")
+            messagebox.showerror("오류", str(exc))
+            return
+
+        self.selected_paths = paths
+        self._update_selection_summary()
+        self.status_var.set(f"폴더에서 이미지 {len(self.selected_paths)}장을 불러왔습니다.")
+        self._update_action_states()
+
+    def clear_selection(self) -> None:
+        self.selected_paths = []
+        self._update_selection_summary()
+        self.status_var.set("인덱싱할 이미지 선택을 초기화했습니다.")
+        self._update_action_states()
+
+    def build_index(self) -> None:
+        if self._is_busy():
+            return
+        if not self.selected_paths:
+            self.status_var.set("먼저 인덱싱할 이미지를 선택하세요.")
+            messagebox.showerror("입력 오류", "이미지 또는 이미지 폴더를 먼저 선택하세요.")
+            return
+
+        image_paths_snapshot = list(self.selected_paths)
+        self.is_indexing = True
+        self._update_action_states()
+        self.index_meta_var.set(
+            "선택한 이미지들에 대해 Vision 설명 생성과 임베딩 계산을 진행하고 있습니다. 이미지 수에 따라 시간이 걸릴 수 있습니다."
+        )
+        self.status_var.set("인덱스를 생성 중입니다...")
+        self._set_index_overview("캡션과 임베딩을 생성 중입니다.\n잠시만 기다려 주세요.")
+        self._set_ranking_text("새 인덱스를 생성하는 동안 검색 결과가 잠시 비활성화됩니다.")
+        self._clear_result_preview()
+
+        worker = threading.Thread(
+            target=self._build_index_worker,
+            args=(image_paths_snapshot,),
+            daemon=True,
+        )
+        worker.start()
+
+    def _build_index_worker(self, image_paths: list[Path]) -> None:
+        try:
+            index = self.search_service.build_and_save_index(image_paths, DEFAULT_INDEX_PATH)
+        except Exception as exc:
+            self.after(0, self._handle_index_error, str(exc))
+            return
+
+        self.after(0, self._apply_index_result, index)
+
+    def _apply_index_result(self, index: ImageSearchIndex) -> None:
+        self.index = index
+        self.is_indexing = False
+        self._refresh_index_overview()
+        self._set_ranking_text(
+            "인덱스 생성이 완료되었습니다.\n\n"
+            "이제 텍스트 쿼리를 입력하고 '유사 이미지 검색' 버튼을 눌러 결과를 확인하세요."
+        )
+        self.status_var.set(f"이미지 {len(index.entries)}장에 대한 인덱스 생성이 완료되었습니다.")
+        self._update_action_states()
+
+    def _handle_index_error(self, error_message: str) -> None:
+        self.is_indexing = False
+        self._update_action_states()
+        self.status_var.set("인덱스 생성 중 오류가 발생했습니다.")
+        self.index_meta_var.set("인덱스 생성에 실패했습니다. 선택한 이미지와 API 설정을 다시 확인해 주세요.")
+        self._set_index_overview("인덱스 생성에 실패했습니다.")
+        messagebox.showerror("오류", error_message)
+
+    def search_images(self) -> None:
+        if self._is_busy():
+            return
+
+        query = self.query_var.get().strip()
+        if not query:
+            self.status_var.set("검색어를 입력하세요.")
+            self.query_entry.focus_set()
+            return
+
+        if self.index is None:
+            try:
+                self.index = self.search_service.load_index(DEFAULT_INDEX_PATH)
+                self._refresh_index_overview()
+            except Exception as exc:
+                self.status_var.set("검색 가능한 인덱스가 없습니다.")
+                messagebox.showerror("오류", str(exc))
+                return
+
+        self.is_searching = True
+        self._update_action_states()
+        self.status_var.set(f"'{query}'와 가장 유사한 이미지를 검색 중입니다.")
+        self.result_meta_var.set("저장된 이미지 설명 임베딩과 텍스트 쿼리 임베딩의 유사도를 계산하고 있습니다.")
+        self._set_ranking_text("유사도 계산 중입니다.\n잠시만 기다려 주세요.")
+
+        worker = threading.Thread(
+            target=self._search_worker,
+            args=(query, self.index),
+            daemon=True,
+        )
+        worker.start()
+
+    def _search_worker(self, query: str, index: ImageSearchIndex) -> None:
+        try:
+            results = self.search_service.search(query, index, top_k=5)
+        except Exception as exc:
+            self.after(0, self._handle_search_error, str(exc))
+            return
+
+        self.after(0, self._apply_search_results, query, results)
+
+    def _apply_search_results(self, query: str, results: list[SearchResult]) -> None:
+        self.is_searching = False
+        self._update_action_states()
+
+        if not results:
+            self.status_var.set("검색 결과가 없습니다.")
+            self._clear_result_preview()
+            self._set_ranking_text("검색 결과가 없습니다.")
+            return
+
+        best_result = results[0]
+        self._show_result_preview(best_result, query)
+        self._set_ranking_text(self._format_results(results))
+        self.status_var.set(
+            f"'{query}'와 가장 유사한 이미지로 {best_result.entry.file_name}을(를) 찾았습니다."
+        )
+
+    def _handle_search_error(self, error_message: str) -> None:
+        self.is_searching = False
+        self._update_action_states()
+        self.status_var.set("검색 중 오류가 발생했습니다.")
+        self.result_meta_var.set("검색 중 오류가 발생했습니다. 쿼리와 인덱스를 다시 확인해 주세요.")
+        self._set_ranking_text("검색에 실패했습니다.")
+        messagebox.showerror("오류", error_message)
+
+    def _show_result_preview(self, result: SearchResult, query: str) -> None:
+        image_path = result.entry.path
+        preview_photo = self._create_preview_photo(image_path)
+        self.result_photo = preview_photo
+
+        if preview_photo is not None:
+            self.result_image_label.configure(image=preview_photo, text="")
+        else:
+            self.result_image_label.configure(image="", text="이 이미지는 미리보기를 표시할 수 없습니다.")
+
+        self.result_title_var.set(f"Best Match: {result.entry.file_name}")
+        self.result_meta_var.set(
+            f"쿼리: '{query}'\n유사도 점수: {result.score:.4f}\n경로: {image_path}"
+        )
+        self.result_caption_var.set(f"저장된 이미지 설명:\n{result.entry.caption}")
+
+    def _clear_result_preview(self) -> None:
+        self.result_photo = None
+        self.result_image_label.configure(
+            image="",
+            text="검색 결과 이미지가 여기에 표시됩니다.",
+        )
+        self.result_title_var.set("검색 결과 미리보기")
+        self.result_meta_var.set("텍스트 쿼리를 입력하면 가장 유사한 이미지를 이곳에 표시합니다.")
+        self.result_caption_var.set("이미지 캡션과 유사도 점수가 여기에 표시됩니다.")
+
+    def _create_preview_photo(self, image_path: Path) -> Optional[ImageTk.PhotoImage]:
+        try:
+            with Image.open(image_path) as image:
+                normalized = ImageOps.exif_transpose(image)
+                if normalized.mode not in ("RGB", "RGBA"):
+                    normalized = normalized.convert("RGBA")
+                copied = normalized.copy()
+        except Exception:
+            return None
+
+        copied.thumbnail((520, 300), RESAMPLE)
+        return ImageTk.PhotoImage(copied)
+
+    def _refresh_index_overview(self) -> None:
+        if self.index is None or not self.index.entries:
+            self.index_meta_var.set("저장된 인덱스가 없습니다.")
+            self._set_index_overview("아직 인덱싱된 이미지가 없습니다.")
+            return
+
+        self.index_meta_var.set(
+            f"총 {len(self.index.entries)}장의 이미지가 인덱싱되어 있습니다.\n"
+            f"캡션 모델: {self.index.caption_model} | 임베딩 모델: {self.index.embedding_model}\n"
+            f"저장 파일: {DEFAULT_INDEX_PATH}"
+        )
+        lines: list[str] = []
+        for index_number, entry in enumerate(self.index.entries, start=1):
+            lines.append(f"{index_number}. {entry.file_name}")
+            lines.append(f"경로: {entry.image_path}")
+            lines.append(f"설명: {entry.caption}")
+            lines.append("")
+        self._set_index_overview("\n".join(lines).strip())
+
+    def _set_index_overview(self, text: str) -> None:
+        self.index_overview.configure(state="normal")
+        self.index_overview.delete("1.0", tk.END)
+        self.index_overview.insert(tk.END, text)
+        self.index_overview.configure(state="disabled")
+
+    def _set_ranking_text(self, text: str) -> None:
+        self.ranking_text.configure(state="normal")
+        self.ranking_text.delete("1.0", tk.END)
+        self.ranking_text.insert(tk.END, text)
+        self.ranking_text.configure(state="disabled")
+
+    def _format_results(self, results: list[SearchResult]) -> str:
+        lines: list[str] = []
+        for rank, result in enumerate(results, start=1):
+            lines.append(f"{rank}. {result.entry.file_name}  |  score={result.score:.4f}")
+            lines.append(f"설명: {result.entry.caption}")
+            lines.append(f"경로: {result.entry.image_path}")
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _update_selection_summary(self) -> None:
+        if not self.selected_paths:
+            self.selection_summary_var.set(
+                "아직 인덱싱할 이미지가 선택되지 않았습니다. "
+                f"새 인덱스를 생성하면 {DEFAULT_INDEX_PATH.name} 파일로 저장됩니다."
+            )
+            return
+
+        self.selection_summary_var.set(
+            f"현재 {len(self.selected_paths)}장의 이미지가 인덱싱 대상으로 선택되어 있습니다. "
+            "인덱스 생성 시 각 이미지 설명과 임베딩이 저장됩니다."
+        )
+
+    def _load_saved_index_if_exists(self) -> None:
+        if not DEFAULT_INDEX_PATH.exists():
+            self.index = None
+            self.index_meta_var.set(
+                f"저장된 인덱스가 없습니다. 새로 생성하면 {DEFAULT_INDEX_PATH} 경로에 저장됩니다."
+            )
+            self.status_var.set("이미지를 선택해 인덱스를 생성한 뒤 검색하세요.")
+            return
+
+        try:
+            self.index = self.search_service.load_index(DEFAULT_INDEX_PATH)
+        except Exception as exc:
+            self.index = None
+            self.index_meta_var.set(f"저장된 인덱스를 불러오지 못했습니다: {exc}")
+            self.status_var.set("저장된 인덱스를 읽지 못했습니다. 새 인덱스를 생성해 주세요.")
+            self._set_index_overview("저장된 인덱스를 읽지 못했습니다.")
+            return
+
+        self._refresh_index_overview()
+        self.status_var.set(f"저장된 이미지 인덱스 {len(self.index.entries)}장을 불러왔습니다.")
+
+    def _is_busy(self) -> bool:
+        return self.is_indexing or self.is_searching
+
+    def _update_action_states(self) -> None:
+        busy = self._is_busy()
+        button_state = "disabled" if busy else "normal"
+
+        self.select_images_button.configure(state=button_state)
+        self.select_folder_button.configure(state=button_state)
+        self.clear_selection_button.configure(
+            state="disabled" if busy or not self.selected_paths else "normal"
+        )
+        self.build_index_button.configure(
+            state="disabled" if busy or not self.selected_paths else "normal"
+        )
+        self.search_button.configure(
+            state="disabled" if busy or self.index is None else "normal"
+        )
+        self.query_entry.configure(state="disabled" if busy else "normal")
+
+    def on_query_return(self, _event: tk.Event) -> str:
+        self.search_images()
+        return "break"
+
+
+class PaperClusterTab(tk.Frame):
+    def __init__(self, master: tk.Misc, clustering_service: PaperClusteringService) -> None:
+        super().__init__(master, bg=APP_BG)
+        self.clustering_service = clustering_service
+
+        self.selected_paths: list[Path] = []
+        self.result: Optional[PaperClusteringResult] = None
+        self.plot_photo: Optional[ImageTk.PhotoImage] = None
+        self.is_clustering = False
+
+        self.cluster_count_var = tk.IntVar(value=2)
+        self.selection_summary_var = tk.StringVar(
+            value="PDF 논문을 선택하면 제목 추정, 임베딩 생성, K-Means 클러스터링을 진행합니다."
+        )
+        self.cluster_meta_var = tk.StringVar(
+            value="아직 클러스터링 결과가 없습니다. PDF를 선택하고 클러스터 수를 지정하세요."
+        )
+        self.plot_title_var = tk.StringVar(value="클러스터 시각화")
+        self.plot_meta_var = tk.StringVar(
+            value="PCA 2D 시각화가 생성되면 이 영역에서 군집 분포를 확인할 수 있습니다."
+        )
+        self.status_var = tk.StringVar(value="PDF 논문을 선택한 뒤 클러스터링을 실행하세요.")
+
+        self._build_ui()
+        self._set_cluster_output(
+            "클러스터 결과가 여기에 표시됩니다.\n\n"
+            "왼쪽에는 클러스터별 논문 목록과 제목이, 오른쪽 아래에는 논문별 요약 미리보기가 표시됩니다."
+        )
+        self._set_document_output(
+            "논문별 세부 정보가 여기에 표시됩니다.\n\n"
+            "클러스터링이 완료되면 각 논문의 제목, 파일명, 추출 텍스트 일부를 확인할 수 있습니다."
+        )
+        self._clear_plot_preview()
+        self._update_action_states()
+
+    def _build_ui(self) -> None:
+        main_frame = tk.Frame(self, bg=APP_BG, padx=8, pady=14)
+        main_frame.pack(fill="both", expand=True)
+
+        header_frame = tk.Frame(main_frame, bg=APP_BG)
+        header_frame.pack(fill="x", pady=(0, 16))
+
+        tk.Label(
+            header_frame,
+            text="PDF 논문 의미 기반 클러스터링",
+            bg=APP_BG,
+            fg=TEXT_COLOR,
+            font=("Helvetica", 21, "bold"),
+        ).pack(anchor="w")
+
+        tk.Label(
+            header_frame,
+            text="PDF에서 텍스트를 추출하고 임베딩을 만든 뒤, 의미적으로 비슷한 논문끼리 클러스터링합니다.",
+            bg=APP_BG,
+            fg=MUTED_TEXT,
+            font=("Helvetica", 11),
+        ).pack(anchor="w", pady=(6, 0))
+
+        controls_card = tk.Frame(
+            main_frame,
+            bg=SURFACE_BG,
+            padx=18,
+            pady=16,
+            highlightbackground=BORDER_COLOR,
+            highlightthickness=1,
+        )
+        controls_card.pack(fill="x", pady=(0, 18))
+
+        self.select_pdfs_button = ttk.Button(
+            controls_card,
+            text="PDF 선택",
+            style="Secondary.TButton",
+            command=self.select_pdfs,
+        )
+        self.select_pdfs_button.grid(row=0, column=0, padx=(0, 8), pady=4, sticky="w")
+
+        self.select_folder_button = ttk.Button(
+            controls_card,
+            text="폴더 불러오기",
+            style="Secondary.TButton",
+            command=self.select_folder,
+        )
+        self.select_folder_button.grid(row=0, column=1, padx=(0, 8), pady=4, sticky="w")
+
+        self.clear_button = ttk.Button(
+            controls_card,
+            text="선택 초기화",
+            style="Secondary.TButton",
+            command=self.clear_selection,
+        )
+        self.clear_button.grid(row=0, column=2, padx=(0, 18), pady=4, sticky="w")
+
+        tk.Label(
+            controls_card,
+            text="클러스터 수",
+            bg=SURFACE_BG,
+            fg=TEXT_COLOR,
+            font=("Helvetica", 10, "bold"),
+        ).grid(row=0, column=3, padx=(0, 8), pady=4, sticky="e")
+
+        self.cluster_spinbox = tk.Spinbox(
+            controls_card,
+            from_=1,
+            to=20,
+            textvariable=self.cluster_count_var,
+            width=6,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=BORDER_COLOR,
+            bg="#fffdfa",
+            fg=TEXT_COLOR,
+        )
+        self.cluster_spinbox.grid(row=0, column=4, padx=(0, 18), pady=4, sticky="w")
+
+        self.cluster_button = ttk.Button(
+            controls_card,
+            text="클러스터링 실행",
+            style="Primary.TButton",
+            command=self.run_clustering,
+        )
+        self.cluster_button.grid(row=0, column=5, pady=4, sticky="w")
+
+        tk.Label(
+            controls_card,
+            textvariable=self.selection_summary_var,
+            bg=SURFACE_BG,
+            fg=MUTED_TEXT,
+            font=("Helvetica", 10),
+            justify="left",
+            wraplength=900,
+        ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(12, 0))
+
+        content_frame = tk.Frame(main_frame, bg=APP_BG)
+        content_frame.pack(fill="both", expand=True)
+        content_frame.grid_columnconfigure(0, weight=6)
+        content_frame.grid_columnconfigure(1, weight=6)
+        content_frame.grid_rowconfigure(0, weight=1)
+
+        left_panel = tk.Frame(content_frame, bg=APP_BG)
+        left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+
+        right_panel = tk.Frame(content_frame, bg=APP_BG)
+        right_panel.grid(row=0, column=1, sticky="nsew")
+
+        self._build_cluster_result_panel(left_panel)
+        self._build_plot_panel(right_panel)
+        self._build_document_panel(right_panel)
+
+        tk.Label(
+            main_frame,
+            textvariable=self.status_var,
+            bg=STATUS_BG,
+            fg=TEXT_COLOR,
+            font=("Helvetica", 10),
+            anchor="w",
+            padx=12,
+            pady=10,
+            highlightbackground=BORDER_COLOR,
+            highlightthickness=1,
+        ).pack(fill="x", pady=(16, 0))
+
+    def _build_cluster_result_panel(self, parent: tk.Frame) -> None:
+        result_card = tk.Frame(
+            parent,
+            bg=SURFACE_BG,
+            padx=16,
+            pady=16,
+            highlightbackground=BORDER_COLOR,
+            highlightthickness=1,
+        )
+        result_card.pack(fill="both", expand=True)
+
+        tk.Label(
+            result_card,
+            text="클러스터 결과",
+            bg=SURFACE_BG,
+            fg=TEXT_COLOR,
+            font=("Helvetica", 15, "bold"),
+        ).pack(anchor="w")
+
+        tk.Label(
+            result_card,
+            textvariable=self.cluster_meta_var,
+            bg=SURFACE_BG,
+            fg=MUTED_TEXT,
+            font=("Helvetica", 10),
+            justify="left",
+            wraplength=440,
+        ).pack(anchor="w", pady=(4, 12))
+
+        self.cluster_output = scrolledtext.ScrolledText(
+            result_card,
+            wrap=tk.WORD,
+            font=("Helvetica", 10),
+            bg="#fffdfa",
+            fg=TEXT_COLOR,
+            relief="flat",
+            highlightthickness=0,
+            padx=12,
+            pady=12,
+            spacing1=2,
+            spacing3=6,
+        )
+        self.cluster_output.pack(fill="both", expand=True)
+
+    def _build_plot_panel(self, parent: tk.Frame) -> None:
+        plot_card = tk.Frame(
+            parent,
+            bg=SURFACE_BG,
+            padx=16,
+            pady=16,
+            highlightbackground=BORDER_COLOR,
+            highlightthickness=1,
+        )
+        plot_card.pack(fill="both", expand=False)
+
+        tk.Label(
+            plot_card,
+            textvariable=self.plot_title_var,
+            bg=SURFACE_BG,
+            fg=TEXT_COLOR,
+            font=("Helvetica", 15, "bold"),
+        ).pack(anchor="w")
+
+        tk.Label(
+            plot_card,
+            textvariable=self.plot_meta_var,
+            bg=SURFACE_BG,
+            fg=MUTED_TEXT,
+            font=("Helvetica", 10),
+            justify="left",
+            wraplength=520,
+        ).pack(anchor="w", pady=(4, 12))
+
+        self.plot_holder = tk.Frame(plot_card, bg=PANEL_BG, height=320)
+        self.plot_holder.pack(fill="both", expand=False)
+        self.plot_holder.pack_propagate(False)
+
+        self.plot_label = tk.Label(
+            self.plot_holder,
+            bg=PANEL_BG,
+            fg=MUTED_TEXT,
+            text="클러스터 시각화 이미지가 여기에 표시됩니다.",
+            font=("Helvetica", 12),
+            justify="center",
+            wraplength=480,
+        )
+        self.plot_label.pack(fill="both", expand=True, padx=18, pady=18)
+
+    def _build_document_panel(self, parent: tk.Frame) -> None:
+        document_card = tk.Frame(
+            parent,
+            bg=SURFACE_BG,
+            padx=16,
+            pady=16,
+            highlightbackground=BORDER_COLOR,
+            highlightthickness=1,
+        )
+        document_card.pack(fill="both", expand=True, pady=(12, 0))
+
+        tk.Label(
+            document_card,
+            text="논문별 세부 정보",
+            bg=SURFACE_BG,
+            fg=TEXT_COLOR,
+            font=("Helvetica", 15, "bold"),
+        ).pack(anchor="w")
+
+        tk.Label(
+            document_card,
+            text=f"시각화 파일은 {DEFAULT_CLUSTER_PLOT_PATH} 경로에 저장됩니다.",
+            bg=SURFACE_BG,
+            fg=MUTED_TEXT,
+            font=("Helvetica", 10),
+        ).pack(anchor="w", pady=(4, 12))
+
+        self.document_output = scrolledtext.ScrolledText(
+            document_card,
+            wrap=tk.WORD,
+            font=("Helvetica", 10),
+            bg="#fffdfa",
+            fg=TEXT_COLOR,
+            relief="flat",
+            highlightthickness=0,
+            padx=12,
+            pady=12,
+            spacing1=2,
+            spacing3=6,
+        )
+        self.document_output.pack(fill="both", expand=True)
+
+    def select_pdfs(self) -> None:
+        file_paths = filedialog.askopenfilenames(
+            title="클러스터링할 PDF 논문 선택",
+            filetypes=[
+                ("PDF files", "*.pdf"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not file_paths:
+            return
+
+        self.selected_paths = [Path(path) for path in file_paths]
+        self._update_selection_summary()
+        self.status_var.set(f"클러스터링할 PDF 논문 {len(self.selected_paths)}편을 선택했습니다.")
+        self._update_action_states()
+
+    def select_folder(self) -> None:
+        directory = filedialog.askdirectory(title="PDF 논문 폴더 선택")
+        if not directory:
+            return
+
+        try:
+            paths = self.clustering_service.discover_pdfs_in_directory(Path(directory))
+            if not paths:
+                raise ValueError("선택한 폴더 안에 PDF 논문이 없습니다.")
+        except Exception as exc:
+            self.status_var.set("폴더 선택 중 오류가 발생했습니다.")
+            messagebox.showerror("오류", str(exc))
+            return
+
+        self.selected_paths = paths
+        self._update_selection_summary()
+        self.status_var.set(f"폴더에서 PDF 논문 {len(self.selected_paths)}편을 불러왔습니다.")
+        self._update_action_states()
+
+    def clear_selection(self) -> None:
+        self.selected_paths = []
+        self._update_selection_summary()
+        self.status_var.set("선택한 PDF 논문 목록을 초기화했습니다.")
+        self._update_action_states()
+
+    def run_clustering(self) -> None:
+        if self.is_clustering:
+            return
+
+        if not self.selected_paths:
+            self.status_var.set("먼저 PDF 논문을 선택하세요.")
+            messagebox.showerror("입력 오류", "PDF 논문 파일이나 폴더를 먼저 선택하세요.")
+            return
+
+        try:
+            cluster_count = int(self.cluster_count_var.get())
+        except Exception:
+            self.status_var.set("클러스터 수를 확인하세요.")
+            messagebox.showerror("입력 오류", "클러스터 수는 정수여야 합니다.")
+            return
+
+        if cluster_count < 1 or cluster_count > len(self.selected_paths):
+            self.status_var.set("클러스터 수를 다시 지정하세요.")
+            messagebox.showerror(
+                "입력 오류",
+                f"클러스터 수는 1 이상, 선택한 논문 수({len(self.selected_paths)}) 이하여야 합니다.",
+            )
+            return
+
+        pdf_paths_snapshot = list(self.selected_paths)
+        self.is_clustering = True
+        self._update_action_states()
+        self.cluster_meta_var.set(
+            "PDF 텍스트 추출, 임베딩 생성, K-Means 클러스터링을 순서대로 진행하고 있습니다."
+        )
+        self.status_var.set("논문 클러스터링을 실행 중입니다...")
+        self._set_cluster_output("논문 텍스트를 추출하고 임베딩을 생성 중입니다.\n잠시만 기다려 주세요.")
+        self._set_document_output("논문 정보를 준비 중입니다.")
+        self._clear_plot_preview()
+
+        worker = threading.Thread(
+            target=self._cluster_worker,
+            args=(pdf_paths_snapshot, cluster_count),
+            daemon=True,
+        )
+        worker.start()
+
+    def _cluster_worker(self, pdf_paths: list[Path], cluster_count: int) -> None:
+        try:
+            result = self.clustering_service.cluster_papers(
+                pdf_paths=pdf_paths,
+                cluster_count=cluster_count,
+                plot_path=DEFAULT_CLUSTER_PLOT_PATH,
+            )
+        except Exception as exc:
+            self.after(0, self._handle_clustering_error, str(exc))
+            return
+
+        self.after(0, self._apply_clustering_result, result)
+
+    def _apply_clustering_result(self, result: PaperClusteringResult) -> None:
+        self.result = result
+        self.is_clustering = False
+        self._update_action_states()
+        self.cluster_meta_var.set(
+            f"총 {len(result.documents)}편의 논문을 {result.cluster_count}개 클러스터로 분류했습니다.\n"
+            f"임베딩 모델: {result.embedding_model}"
+        )
+        self._set_cluster_output(self._format_cluster_output(result))
+        self._set_document_output(self._format_document_output(result))
+        self._show_plot_preview(result.plot_path)
+        self.status_var.set(
+            f"논문 {len(result.documents)}편의 클러스터링이 완료되었습니다."
+        )
+
+    def _handle_clustering_error(self, error_message: str) -> None:
+        self.is_clustering = False
+        self._update_action_states()
+        self.cluster_meta_var.set("클러스터링 중 오류가 발생했습니다. PDF 파일과 환경 설정을 다시 확인해 주세요.")
+        self.status_var.set("클러스터링 중 오류가 발생했습니다.")
+        self._set_cluster_output("클러스터링에 실패했습니다.")
+        self._set_document_output("논문 정보를 표시할 수 없습니다.")
+        messagebox.showerror("오류", error_message)
+
+    def _format_cluster_output(self, result: PaperClusteringResult) -> str:
+        cluster_map: dict[int, list[str]] = {}
+        for document in result.documents:
+            label = document.cluster_label or 0
+            cluster_map.setdefault(label, []).append(document.title)
+
+        lines: list[str] = [
+            f"[클러스터 수] {result.cluster_count}",
+            f"[문서 수] {len(result.documents)}",
+            "",
+        ]
+        for label in sorted(cluster_map):
+            lines.append(f"Cluster {label + 1}")
+            for title in cluster_map[label]:
+                lines.append(f"- {title}")
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _format_document_output(self, result: PaperClusteringResult) -> str:
+        lines: list[str] = []
+        for index, document in enumerate(result.documents, start=1):
+            label = (document.cluster_label or 0) + 1
+            lines.append(f"{index}. {document.title}")
+            lines.append(f"클러스터: Cluster {label}")
+            lines.append(f"파일명: {document.file_name}")
+            lines.append(f"경로: {document.pdf_path}")
+            lines.append(f"미리보기: {document.preview_text}")
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _show_plot_preview(self, plot_path: str | None) -> None:
+        if not plot_path:
+            self._clear_plot_preview()
+            self.plot_meta_var.set(
+                "시각화를 만들 수 있는 조건이 충분하지 않아 텍스트 결과만 표시했습니다."
+            )
+            return
+
+        try:
+            with Image.open(plot_path) as image:
+                copied = image.copy()
+        except Exception:
+            self._clear_plot_preview()
+            self.plot_meta_var.set("시각화 파일을 불러오지 못했습니다.")
+            return
+
+        copied.thumbnail((520, 300), RESAMPLE)
+        self.plot_photo = ImageTk.PhotoImage(copied)
+        self.plot_label.configure(image=self.plot_photo, text="")
+        self.plot_title_var.set("클러스터 시각화")
+        self.plot_meta_var.set(f"PCA 2D 시각화 결과를 표시합니다.\n파일: {plot_path}")
+
+    def _clear_plot_preview(self) -> None:
+        self.plot_photo = None
+        self.plot_label.configure(
+            image="",
+            text="클러스터 시각화 이미지가 여기에 표시됩니다.",
+        )
+        self.plot_title_var.set("클러스터 시각화")
+        self.plot_meta_var.set(
+            "PCA 2D 시각화가 생성되면 이 영역에서 군집 분포를 확인할 수 있습니다."
+        )
+
+    def _set_cluster_output(self, text: str) -> None:
+        self.cluster_output.configure(state="normal")
+        self.cluster_output.delete("1.0", tk.END)
+        self.cluster_output.insert(tk.END, text)
+        self.cluster_output.configure(state="disabled")
+
+    def _set_document_output(self, text: str) -> None:
+        self.document_output.configure(state="normal")
+        self.document_output.delete("1.0", tk.END)
+        self.document_output.insert(tk.END, text)
+        self.document_output.configure(state="disabled")
+
+    def _update_selection_summary(self) -> None:
+        if not self.selected_paths:
+            self.selection_summary_var.set(
+                "PDF 논문을 선택하면 제목 추정, 임베딩 생성, K-Means 클러스터링을 진행합니다."
+            )
+            return
+
+        self.selection_summary_var.set(
+            f"현재 {len(self.selected_paths)}편의 PDF 논문이 선택되어 있습니다. "
+            "클러스터 수를 지정한 뒤 실행하면 논문 제목과 클러스터 결과를 함께 출력합니다."
+        )
+
+    def _update_action_states(self) -> None:
+        button_state = "disabled" if self.is_clustering else "normal"
+
+        self.select_pdfs_button.configure(state=button_state)
+        self.select_folder_button.configure(state=button_state)
+        self.clear_button.configure(
+            state="disabled" if self.is_clustering or not self.selected_paths else "normal"
+        )
+        self.cluster_button.configure(
+            state="disabled" if self.is_clustering or not self.selected_paths else "normal"
+        )
+        self.cluster_spinbox.configure(state="disabled" if self.is_clustering else "normal")
+
+
 class CreativeStudioApp:
-    def __init__(self, root: tk.Tk, story_generator: StoryGenerator, historical_chatbot: HistoricalChatbot) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        story_generator: StoryGenerator,
+        historical_chatbot: HistoricalChatbot,
+        image_search_service: SemanticImageSearchService,
+        paper_clustering_service: PaperClusteringService,
+    ) -> None:
         self.root = root
         self.story_generator = story_generator
         self.historical_chatbot = historical_chatbot
+        self.image_search_service = image_search_service
+        self.paper_clustering_service = paper_clustering_service
 
         self.root.title("이미지 스토리 & 역사 인물 대화 스튜디오")
         self.root.geometry("1280x840")
@@ -1190,7 +2336,7 @@ class CreativeStudioApp:
 
         tk.Label(
             header_frame,
-            text="Practice3의 이미지 기반 스토리 생성과 Practice4의 역사 인물 챗봇을 하나의 GUI에서 실행합니다.",
+            text="Practice3, Practice4, Practice5, Practice6 과제를 하나의 탭형 GUI에서 실행할 수 있도록 통합했습니다.",
             bg=APP_BG,
             fg=MUTED_TEXT,
             font=("Helvetica", 11),
@@ -1201,9 +2347,13 @@ class CreativeStudioApp:
 
         story_tab = StoryTab(notebook, self.story_generator)
         chat_tab = HistoricalChatTab(notebook, self.historical_chatbot)
+        image_search_tab = ImageSearchTab(notebook, self.image_search_service)
+        paper_cluster_tab = PaperClusterTab(notebook, self.paper_clustering_service)
 
         notebook.add(story_tab, text="이미지 스토리")
         notebook.add(chat_tab, text="역사 인물 챗봇")
+        notebook.add(image_search_tab, text="이미지 검색")
+        notebook.add(paper_cluster_tab, text="논문 클러스터링")
 
 
 def main() -> None:
@@ -1212,13 +2362,28 @@ def main() -> None:
         client = create_openai_client()
         story_generator = StoryGenerator(client=client, model=DEFAULT_STORY_MODEL)
         historical_chatbot = HistoricalChatbot(client=client, model=DEFAULT_CHAT_MODEL)
+        image_search_service = SemanticImageSearchService(
+            client=client,
+            caption_model=DEFAULT_CAPTION_MODEL,
+            embedding_model=DEFAULT_EMBEDDING_MODEL,
+        )
+        paper_clustering_service = PaperClusteringService(
+            client=client,
+            embedding_model=DEFAULT_PAPER_EMBEDDING_MODEL,
+        )
     except Exception as exc:
         root.withdraw()
         messagebox.showerror("환경 설정 오류", str(exc))
         root.destroy()
         return
 
-    CreativeStudioApp(root, story_generator, historical_chatbot)
+    CreativeStudioApp(
+        root,
+        story_generator,
+        historical_chatbot,
+        image_search_service,
+        paper_clustering_service,
+    )
     root.mainloop()
 
 

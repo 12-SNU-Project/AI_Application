@@ -4,9 +4,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from project_paths import IMAGE_SEARCH_INDEX_PATH
+
 
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
-DEFAULT_INDEX_PATH = Path(__file__).resolve().parent / "image_search_index.json"
+DEFAULT_INDEX_PATH = IMAGE_SEARCH_INDEX_PATH
 
 
 @dataclass
